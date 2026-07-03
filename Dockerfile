@@ -1,0 +1,54 @@
+# syntax=docker/dockerfile:1.6
+# Builder stage - Pin to immutable base image digest for reproducibility
+FROM debian:bookworm-slim@sha256:96e378d7e6531ac9a15ad505478fcc2e69f371b10f5cdf87857c4b8188404716 AS builder
+
+ARG PGBOUNCER_VERSION=1.25.2
+ARG PGBOUNCER_SHA256=924ad35113fd0a71c8e2dbe85b5d03445532e2b7b37a9f8a48983beea238b332
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
+    curl \
+    libevent-dev \
+    libssl-dev \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+# Verify source tarball integrity using official SHA-256 checksum
+RUN curl -fsSL "https://www.pgbouncer.org/downloads/files/${PGBOUNCER_VERSION}/pgbouncer-${PGBOUNCER_VERSION}.tar.gz" \
+    -o pgbouncer.tar.gz \
+    && echo "${PGBOUNCER_SHA256}  pgbouncer.tar.gz" | sha256sum -c - \
+    && tar -xz --strip-components=1 -f pgbouncer.tar.gz \
+    && rm pgbouncer.tar.gz \
+    && ./configure \
+    --prefix=/usr/local \
+    --with-openssl \
+    --disable-debug \
+    && make pgbouncer \
+    && cp pgbouncer /usr/local/bin/pgbouncer
+
+# Runtime stage - Pin to matching immutable base image digest
+FROM debian:bookworm-slim@sha256:96e378d7e6531ac9a15ad505478fcc2e69f371b10f5cdf87857c4b8188404716
+
+# Install minimal runtime dependencies only (--no-install-recommends)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libevent-2.1-7 \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd -r -g 10070 pgbouncer \
+    # Create non-privileged high-UID pgbouncer user (avoids host UID collisions) and block shell access
+    && useradd -r -u 10070 -g pgbouncer -d /var/lib/pgbouncer -s /sbin/nologin pgbouncer \
+    && mkdir -p /etc/pgbouncer /var/log/pgbouncer \
+    # Restrict permissions: pgbouncer owner, read/write/execute for owner, read/execute for group, no access for others
+    && chown -R pgbouncer:pgbouncer /etc/pgbouncer /var/log/pgbouncer \
+    && chmod 750 /etc/pgbouncer /var/log/pgbouncer
+# ^ Avoid /var/run directory to allow write operations in read-only filesystems (handled by emptyDir)
+
+COPY --from=builder /usr/local/bin/pgbouncer /usr/local/bin/pgbouncer
+
+# checkov:skip=CKV_DOCKER_2: health is owned by Kubernetes (startup/readiness/liveness probes); a Docker HEALTHCHECK is ignored on K8s
+USER 10070:10070
+EXPOSE 5432
+ENTRYPOINT ["pgbouncer", "/etc/pgbouncer/pgbouncer.ini"]
