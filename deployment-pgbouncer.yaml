@@ -1,0 +1,176 @@
+# Pod Disruption Budget
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: pgbouncer-pdb
+  namespace: prod-hades
+  labels:
+    app: pgbouncer
+    env: prod
+spec:
+  minAvailable: 1 # Ensure at least one replica is always available during disruptions
+  selector:
+    matchLabels:
+      app: pgbouncer
+      env: prod
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pgbouncer
+  namespace: prod-hades
+  annotations:
+    checkov.io/skip1: CKV_K8S_43=Example manifest ships a tag for readability; production must pin the image digest from Step 1 of the README
+spec:
+  replicas: 2
+  revisionHistoryLimit: 6
+  minReadySeconds: 20
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: pgbouncer
+      env: prod
+  template:
+    metadata:
+      labels:
+        app: pgbouncer
+        env: prod
+    spec:
+      automountServiceAccountToken: false # PgBouncer never talks to the K8s API; don't mount a token
+      terminationGracePeriodSeconds: 200
+      nodeSelector:
+        env-pool: production-pool # replace with gke pool node label
+      affinity:
+        podAntiAffinity: # Soft rule: spreads replicas across different nodes, but allows running on a single NodePool VM if only one is available
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - pgbouncer
+                    - key: env
+                      operator: In
+                      values:
+                        - prod
+                topologyKey: kubernetes.io/hostname # Defines the node domain boundary for spreading pods
+          # Strict / Hard rule: forces replicas to run on separate nodes (pod scheduling will block if only 1 VM exists)
+          # requiredDuringSchedulingIgnoredDuringExecution:
+          #   - labelSelector:
+          #       matchExpressions:
+          #         - key: app
+          #           operator: In
+          #           values:
+          #             - pgbouncer
+          #         - key: env
+          #           operator: In
+          #           values:
+          #             - prod
+          #     topologyKey: kubernetes.io/hostname
+      securityContext:
+        runAsNonRoot: true # prevent root process execution
+        runAsUser: 10070 # pgbouncer user UID — high UID avoids host user collisions, no login shell
+        runAsGroup: 10070 # pgbouncer group GID
+        fsGroup: 10070 # all volume mounts accessible only by pgbouncer group
+        seccompProfile:
+          type: RuntimeDefault # filter dangerous syscalls via runtime profile
+        appArmorProfile:
+          type: RuntimeDefault # restrict file, network, and capability access
+      containers:
+        - name: pgbouncer
+          # In production, replace the tag with the immutable digest from Step 1 of the
+          # README (…/pgbouncer@sha256:…) to prevent mutable-tag overwrite attacks.
+          image: asia-southeast2-docker.pkg.dev/your-gcp-project-id/hades/prod/pgbouncer:v2
+          imagePullPolicy: Always # safe default while a mutable tag is used; IfNotPresent is fine once pinned by digest
+          ports:
+            - containerPort: 5432
+              name: pgbouncer
+          securityContext:
+            readOnlyRootFilesystem: true # block any runtime writes to the filesystem
+            allowPrivilegeEscalation: false # Prevent child processes from gaining more privileges than parent
+            capabilities:
+              drop:
+                - ALL # Drop all default Linux capabilities to restrict container OS privileges
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "1"
+              memory: "1000Mi"
+          startupProbe:
+            tcpSocket:
+              port: 5432
+            periodSeconds: 5
+            failureThreshold: 12 # Up to 60s for startup
+          readinessProbe:
+            tcpSocket:
+              port: 5432
+            initialDelaySeconds: 8
+            periodSeconds: 5
+            failureThreshold: 3
+            successThreshold: 1
+          livenessProbe:
+            tcpSocket:
+              port: 5432
+            periodSeconds: 30
+            failureThreshold: 6
+            timeoutSeconds: 5
+          lifecycle: # zero-downtime GKE endpoint propagation sleep
+            preStop:
+              exec:
+                command: ["/bin/sleep", "180"]
+          volumeMounts:
+            - name: config-volume
+              mountPath: /etc/pgbouncer # static configuration files (pgbouncer.ini)
+              readOnly: true
+            - name: secret-volume
+              mountPath: /etc/pgbouncer-auth # dynamic secrets and user list (userlist.txt)
+              readOnly: true
+            - name: certs-volume
+              mountPath: /etc/pgbouncer-certs # database TLS root certs (server-ca.crt)
+              readOnly: true
+            - name: pgbouncer-run
+              mountPath: /var/run/pgbouncer # ephemeral directory for unix sockets and runtime pids
+      volumes:
+        - name: config-volume
+          configMap:
+            name: pgbouncer-config
+        - name: secret-volume
+          secret:
+            secretName: pgbouncer-secret
+        - name: certs-volume
+          secret:
+            secretName: pgbouncer-certs
+        - name: pgbouncer-run
+          emptyDir:
+            medium: Memory # tmpfs: runtime sockets/pids never touch node disk
+---
+# service
+apiVersion: v1
+kind: Service
+metadata:
+  name: pgbouncer
+  namespace: prod-hades
+  labels:
+    app: pgbouncer
+    env: prod
+  annotations:
+    service.kubernetes.io/topology-mode: Auto # Optimize cross-zone routing to reduce latency and egress costs
+spec:
+  selector:
+    app: pgbouncer
+    env: prod
+  ports:
+    - name: postgres
+      port: 5432
+      protocol: TCP
+      targetPort: 5432
+      appProtocol: postgresql # Help monitoring tools and service meshes identify DB traffic
+  type: ClusterIP
